@@ -435,8 +435,7 @@ def _process_view(
     )
 
     if rewrite_kind:
-        rewritten_pointers = _compile_rewrites(
-            pointers,
+        ctx.env.dml_rewrites[ir_set] = _compile_rewrites(
             specified_ptrs,
             rewrite_kind,
             view_scls,
@@ -444,8 +443,6 @@ def _process_view(
             stype,
             s_ctx,
         )
-        for ptr in rewritten_pointers:
-            pointers[ptr.ptrcls] = ptr
 
     if s_ctx.exprtype.is_insert():
         _raise_on_missing(pointers, stype, s_ctx)
@@ -840,17 +837,16 @@ def _raise_on_missing(
 
 
 def _compile_rewrites(
-    pointers: Dict[s_pointers.Pointer, EarlyShapePtr],
     specified_ptrs: Set[sn.UnqualName],
     rewrite_kind: qltypes.RewriteKind,
     view_scls: s_objtypes.ObjectType,
     ir_set: irast.Set,
     stype: s_objtypes.ObjectType,
     s_ctx: ShapeContext,
-) -> Iterable[EarlyShapePtr]:
+) -> irast.Rewrites:
     # init
     anchors = prepare_rewrite_anchors(
-        pointers, specified_ptrs, rewrite_kind, stype, s_ctx.ctx
+        specified_ptrs, rewrite_kind, stype, s_ctx.ctx
     )
 
     # Rewrites are not inherited, which means we need to traverse ancestors
@@ -859,7 +855,11 @@ def _compile_rewrites(
         stype, rewrite_kind, view_scls, ir_set, anchors, s_ctx
     )
 
-    if rewrite_kind == qltypes.RewriteKind.Update:
+    if rewrite_kind == qltypes.RewriteKind.Insert:
+        type_ref = typegen.type_to_typeref(stype, s_ctx.ctx.env)
+        rewrites_by_type = { type_ref: rewrites }
+
+    elif rewrite_kind == qltypes.RewriteKind.Update:
         # Update may also change objects that are children of stype
         # Here we build a dict of rewrites for each descendent type for each
         # of its pointers.
@@ -871,19 +871,17 @@ def _compile_rewrites(
             stype, rewrites, rewrite_kind, view_scls, ir_set, anchors, s_ctx
         )
 
-        # just unwrap EarlyShapeElement
-        plain_rewrites_by_type = {
-            ty: {
-                name: element.target_set
-                for name, element in rewrites.items()
-                if element.target_set
-            }
-            for ty, rewrites in rewrites_by_type.items()
+    else:
+        raise NotImplementedError()
+
+    return {
+        ty: {
+            name: element.target_set
+            for name, element in rewrites.items()
+            if element.target_set
         }
-
-        s_ctx.ctx.env.update_rewrites[ir_set] = plain_rewrites_by_type
-
-    return rewrites.values()
+        for ty, rewrites in rewrites_by_type.items()
+    }
 
 
 def _compile_rewrites_and_inherit(
@@ -1033,78 +1031,35 @@ RewriteAnchors = Tuple[irast.Set, irast.Set, Optional[irast.Set]]
 
 
 def prepare_rewrite_anchors(
-    pointers: Dict[s_pointers.Pointer, EarlyShapePtr],
     specified_ptrs: Set[sn.UnqualName],
     rewrite_kind: qltypes.RewriteKind,
     stype: s_objtypes.ObjectType,
     ctx: context.ContextLevel,
 ) -> RewriteAnchors:
-    scls_pointers = stype.get_pointers(ctx.env.schema)
-
-    source_set = setgen.class_set(stype, ctx=ctx)
+    schema = ctx.env.schema
 
     # init set for __subject__
+    subject_name=sn.QualName("__derived__", "__subject__")
     subject_path_id = irast.PathId.from_type(
-        ctx.env.schema,
-        stype,
-        typename=sn.QualName(module="__derived__", name="__subject__"),
+        schema, stype, typename=subject_name
     )
-    subject_pointers: Dict[str, irast.Set] = {}
-    for pn, ptr in scls_pointers.items(ctx.env.schema):
-        if ptr.is_protected_pointer(ctx.env.schema):
-            continue
-
-        val = None
-        for p, v in pointers.items():
-            if p.get_nearest_non_derived_parent(ctx.env.schema) == ptr:
-                val = v.target_set
-                break
-
-        if not val:
-            ppath_id = irast.PathId.from_pointer(ctx.env.schema, ptr)
-
-            if rewrite_kind == qltypes.RewriteKind.Insert:
-                # construct an empty set
-                ptype = ptr.get_target(ctx.env.schema)
-                assert ptype
-                empty = irast.EmptySet(
-                    path_id=ppath_id,
-                    typeref=ppath_id.target,
-                )
-                ctx.env.set_types[empty] = ptype
-                val = setgen.ensure_set(empty, type_override=ptype, ctx=ctx)
-
-            elif rewrite_kind == qltypes.RewriteKind.Update:
-                val = setgen.extend_path(source_set, ptr, ctx=ctx)
-
-            else:
-                raise NotImplementedError()
-
-        subject_pointers[pn.name] = val
-    subject_set = irast.ComputedObjectSet(
-        path_id=subject_path_id,
-        typeref=subject_path_id.target,
-        computed_pointers=subject_pointers
+    subject_set = setgen.new_set(
+        stype=stype, path_id=subject_path_id, ctx=ctx
     )
 
     # init reference to std::bool
-    bool_type = ctx.env.schema.get("std::bool", type=s_types.Type)
+    bool_type = schema.get("std::bool", type=s_types.Type)
     bool_path = irast.PathId.from_type(
-        ctx.env.schema,
+        schema,
         bool_type,
         typename=sn.QualName(module="std", name="bool"),
     )
 
     # init set for __specified__
-    specified_path_id = irast.PathId.from_type(
-        ctx.env.schema,
-        stype,
-        typename=sn.QualName(module="__derived__", name="__specified__"),
-    )
     specified_pointers: List[irast.TupleElement] = []
-    for pn, _ in scls_pointers.items(ctx.env.schema):
+    for pn, _ in stype.get_pointers(schema).items(schema):
         pointer_path_id = irast.PathId.from_type(
-            ctx.env.schema,
+            schema,
             bool_type,
             typename=sn.QualName(module="__derived__", name=pn.name),
         )
@@ -1122,35 +1077,18 @@ def prepare_rewrite_anchors(
                 path_id=pointer_path_id
             )
         )
-    specified_set = setgen.ensure_set(
-        irast.Tuple(
-            named=True,
-            elements=specified_pointers,
-            typeref=specified_path_id.target,
-        ),
-        ctx=ctx
+    specified_set = setgen.new_tuple_set(
+        specified_pointers, named=True, ctx=ctx
     )
 
     # init set for __old__
     if rewrite_kind == qltypes.RewriteKind.Update:
-
+        old_name=sn.QualName("__derived__", "__old__")
         old_path_id = irast.PathId.from_type(
-            ctx.env.schema,
-            stype,
-            typename=sn.QualName(module="__derived__", name="__old__"),
+            schema, stype, typename=old_name
         )
-        old_pointers: Dict[str, irast.Set] = {}
-        for pn, ptr in scls_pointers.items(ctx.env.schema):
-            if ptr.is_protected_pointer(ctx.env.schema):
-                continue
-
-            val = setgen.extend_path(source_set, ptr, ctx=ctx)
-
-            old_pointers[pn.name] = val
-        old_set = irast.ComputedObjectSet(
-            path_id=old_path_id,
-            typeref=old_path_id.target,
-            computed_pointers=old_pointers
+        old_set = setgen.new_set(
+            stype=stype, path_id=old_path_id, ctx=ctx
         )
     else:
         old_set = None
